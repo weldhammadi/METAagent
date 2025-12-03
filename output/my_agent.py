@@ -1,198 +1,349 @@
+"""Auto-generated agent by Orchestrator."""
 from __future__ import annotations
 
 import os
-import logging
-from typing import Dict, Any, Final, Literal, TypedDict
+import json
+import uuid
+import requests
+from pathlib import Path
+from typing import Dict, Any, List, Optional
 
+import numpy as np
+import streamlit as st
 from dotenv import load_dotenv
 from groq import Groq
+from streamlit_webrtc import AudioProcessorBase, WebRtcMode, webrtc_streamer
 
 # Load environment variables
 load_dotenv()
 
-# --------------------------------------------------------------------------- #
-# Logging configuration (application‑wide, can be overridden by the caller)
-# --------------------------------------------------------------------------- #
 
-_logger = logging.getLogger(__name__)
-if not _logger.handlers:  # Prevent duplicate handlers in interactive sessions
-    _handler = logging.StreamHandler()
-    _formatter = logging.Formatter(
-        fmt="%(asctime)s %(levelname)s %(name)s – %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    _handler.setFormatter(_formatter)
-    _logger.addHandler(_handler)
-    _logger.setLevel(logging.INFO)
-
-# --------------------------------------------------------------------------- #
-# Children story generation
-# --------------------------------------------------------------------------- #
-
-def generate_children_story(prompt: str) -> Dict[str, Any]:
-    """
-    Generates a short children's story based on a user‑provided prompt or theme.
-
-    Args:
-        prompt (str): A non‑empty description, theme or seed sentence that will
-            guide the story generation.
+def get_user_text() -> Dict[str, str]:
+    """Retrieve the text entered by the user in a Streamlit interface.
 
     Returns:
-        Dict[str, Any]: ``{'story_text': <generated story>}``.
+        Dict[str, str]: A dictionary containing the user‑provided text under the
+        ``"text"`` key. If the user has not entered anything, the value is an
+        empty string.
+    """
+    user_input: str = st.text_input(label="Enter text", value="")
+    return {"text": user_input}
+
+
+def get_user_audio() -> bytes:
+    """Capture audio from the user's microphone via Streamlit.
+
+    Returns:
+        bytes: Concatenated raw audio bytes captured from the microphone.
 
     Raises:
-        ValueError: If ``prompt`` is invalid or the API key is missing.
-        RuntimeError: If the Groq request fails or returns an unexpected format.
+        RuntimeError: If the required Streamlit‑WebRTC component cannot be loaded,
+            if the user does not provide any audio, or if an unexpected error occurs.
     """
-    # Validate input
-    if not isinstance(prompt, str) or not prompt.strip():
-        raise ValueError("prompt must be a non‑empty string")
 
-    # Retrieve API key
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        raise ValueError("GROQ_API_KEY not set in environment variables")
+    class _AudioRecorder(AudioProcessorBase):
+        """Collect audio frames into a list for later concatenation."""
 
-    # Initialise Groq client
-    groq_client = Groq(api_key=api_key)
+        def __init__(self) -> None:
+            self._frames: List[bytes] = []
 
-    # Build messages
-    system_message = (
-        "You are a creative storyteller specialized in writing short, "
-        "engaging, age‑appropriate stories for children aged 3‑8. "
-        "Use simple language, vivid imagination, and a gentle moral."
+        def recv(self, frame):  # type: ignore[override]
+            """Receive an audio frame and store its raw bytes."""
+            ndarray = frame.to_ndarray(format="s16")
+            self._frames.append(ndarray.tobytes())
+            return frame
+
+        def get_audio_bytes(self) -> bytes:
+            """Concatenate all stored frames into a single ``bytes`` object."""
+            return b"".join(self._frames)
+
+    webrtc_ctx = webrtc_streamer(
+        key="audio_recorder",
+        mode=WebRtcMode.SENDRECV,
+        audio_processor_factory=_AudioRecorder,
+        media_stream_constraints={"audio": True, "video": False},
+        async_processing=False,
     )
-    user_message = f"Write a children's story based on the following prompt: {prompt}"
 
-    # Call the LLM
+    if not webrtc_ctx.state.playing:
+        st.info("Cliquez sur le bouton **Start** ci‑dessus pour commencer l'enregistrement audio.")
+        raise RuntimeError("Aucun enregistrement audio n'est en cours.")
+
+    if webrtc_ctx.state == webrtc_ctx.state.STOPPED:
+        processor = webrtc_ctx.audio_processor
+        if processor is None:
+            raise RuntimeError("Le processeur audio n'est pas disponible.")
+        audio_bytes = processor.get_audio_bytes()
+        if not audio_bytes:
+            raise RuntimeError("Aucun audio n'a été capturé.")
+        return audio_bytes
+
+    raise RuntimeError("L'enregistrement audio est toujours en cours. Veuillez l'arrêter avant de récupérer les données.")
+
+
+def play_audio(audio_bytes: bytes) -> bool:
+    """Play synthesized speech audio in a Streamlit interface.
+
+    Args:
+        audio_bytes (bytes): Audio data to be played. Must be a non‑empty byte string.
+
+    Returns:
+        bool: ``True`` if the audio was successfully sent to Streamlit for playback.
+
+    Raises:
+        RuntimeError: If ``audio_bytes`` is ``None`` or empty.
+    """
+    if not audio_bytes:
+        raise RuntimeError("Le paramètre audio_bytes est manquant ou vide.")
     try:
-        llm_response = groq_client.chat.completions.create(
-            model="openai/gpt-oss-120b",
-            messages=[
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": user_message},
-            ],
-            temperature=0.6,
-            max_tokens=1024,
-        )
+        st.audio(audio_bytes, format="audio/wav")
     except Exception as exc:
-        raise RuntimeError(f"Failed to generate story via Groq API: {exc}") from exc
+        raise RuntimeError(f"Erreur lors de la lecture de l'audio : {exc}")
+    return True
 
-    # Extract story text
-    try:
-        story_text = llm_response.choices[0].message.content
-    except (AttributeError, IndexError) as exc:
-        raise RuntimeError("Unexpected response format from Groq API") from exc
 
-    return {"story_text": story_text}
+def update_conversation_history(
+    history: List[Dict[str, Any]], role: str, content: str
+) -> List[Dict[str, Any]]:
+    """Append a new message to the conversation history.
+
+    Args:
+        history: Existing conversation history.
+        role: Role of the new message (e.g., "user" or "assistant").
+        content: Text content of the new message.
+
+    Returns:
+        Updated conversation history with the new message appended.
+
+    Raises:
+        RuntimeError: If inputs are of incorrect types.
+    """
+    if not isinstance(history, list):
+        raise RuntimeError("Le paramètre 'history' doit être une liste.")
+    for idx, entry in enumerate(history):
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"L'élément d'index {idx} dans 'history' doit être un dictionnaire.")
+    if not isinstance(role, str):
+        raise RuntimeError("Le paramètre 'role' doit être une chaîne de caractères.")
+    if not isinstance(content, str):
+        raise RuntimeError("Le paramètre 'content' doit être une chaîne de caractères.")
+    updated_history = history.copy()
+    updated_history.append({"role": role, "content": content})
+    return updated_history
+
 
 # --------------------------------------------------------------------------- #
-# Text‑to‑Speech helper
+#                               TEXT‑TO‑SPEECH (FILE)                        #
 # --------------------------------------------------------------------------- #
 
-SUPPORTED_VOICES: Final[list[str]] = [
-    "Aaliyah-PlayAI", "Adelaide-PlayAI", "Angelo-PlayAI", "Arista-PlayAI",
-    "Atlas-PlayAI", "Basil-PlayAI", "Briggs-PlayAI", "Calum-PlayAI",
-    "Celeste-PlayAI", "Cheyenne-PlayAI", "Chip-PlayAI", "Cillian-PlayAI",
-    "Deedee-PlayAI", "Eleanor-PlayAI", "Fritz-PlayAI", "Gail-PlayAI",
-    "Indigo-PlayAI", "Jennifer-PlayAI", "Judy-PlayAI", "Mamaw-PlayAI",
-    "Mason-PlayAI", "Mikail-PlayAI", "Mitch-PlayAI", "Nia-PlayAI",
-    "Quinn-PlayAI", "Ruby-PlayAI", "Thunder-PlayAI",
+SUPPORTED_VOICES = [
+    "Aaliyah-PlayAI",
+    "Adelaide-PlayAI",
+    "Angelo-PlayAI",
+    "Arista-PlayAI",
+    "Atlas-PlayAI",
+    "Basil-PlayAI",
+    "Briggs-PlayAI",
+    "Calum-PlayAI",
+    "Celeste-PlayAI",
+    "Cheyenne-PlayAI",
+    "Chip-PlayAI",
+    "Cillian-PlayAI",
+    "Deedee-PlayAI",
+    "Eleanor-PlayAI",
+    "Fritz-PlayAI",
+    "Gail-PlayAI",
+    "Indigo-PlayAI",
+    "Jennifer-PlayAI",
+    "Judy-PlayAI",
+    "Mamaw-PlayAI",
+    "Mason-PlayAI",
+    "Mikail-PlayAI",
+    "Mitch-PlayAI",
+    "Nia-PlayAI",
+    "Quinn-PlayAI",
+    "Ruby-PlayAI",
+    "Thunder-PlayAI",
 ]
 
-SupportedFormat = Literal["mp3", "opus", "aac", "flac", "wav"]
+_ALLOWED_FORMATS = {"mp3", "opus", "aac", "flac", "wav"}
 
-class SpeechResult(TypedDict):
-    """Typed dictionary returned by ``generate_speech``."""
-    audio_bytes: bytes
 
 def generate_speech(
-    *,
     text: str,
     voice: str = "Aaliyah-PlayAI",
     speed: float = 1.0,
-    output_format: SupportedFormat = "mp3",
-) -> SpeechResult:
-    """
-    Generate spoken audio from plain text using Groq’s PlayAI TTS model.
-
-    Args:
-        text: Non‑empty string to be spoken.
-        voice: One of the voices listed in ``SUPPORTED_VOICES``.
-        speed: Speech speed multiplier between 0.25 and 4.0.
-        output_format: Desired audio container format.
-
-    Returns:
-        SpeechResult containing the raw audio bytes.
-
-    Raises:
-        ValueError: For invalid arguments or missing API key.
-        RuntimeError: If the Groq API call fails or returns an unexpected response.
-    """
-    # Input validation
+    output_format: str = "mp3",
+    output_dir: str | os.PathLike = ".",
+) -> Dict[str, str | int]:
+    """Generate an audio file from *text* using the PlayAI TTS model."""
     if not isinstance(text, str) or not text.strip():
         raise ValueError("`text` must be a non‑empty string.")
     if voice not in SUPPORTED_VOICES:
         raise ValueError(f"`voice` must be one of the supported voices: {SUPPORTED_VOICES}")
     if not isinstance(speed, (int, float)):
-        raise ValueError("`speed` must be a numeric type.")
-    if not 0.25 <= speed <= 4.0:
+        raise ValueError("`speed` must be a numeric value.")
+    if not 0.25 <= float(speed) <= 4.0:
         raise ValueError("`speed` must be between 0.25 and 4.0 (inclusive).")
-    if output_format not in ("mp3", "opus", "aac", "flac", "wav"):
-        raise ValueError("`output_format` must be one of: mp3, opus, aac, flac, wav.")
+    if output_format not in _ALLOWED_FORMATS:
+        raise ValueError(f"`output_format` must be one of {_ALLOWED_FORMATS}, got '{output_format}'.")
+    output_dir_path = Path(output_dir).expanduser().resolve()
+    if not output_dir_path.is_dir():
+        raise ValueError(f"`output_dir` must be an existing directory: {output_dir_path}")
 
-    # Retrieve API key
-    api_key: str | None = os.getenv("GROQ_API_KEY")
+    api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         raise ValueError("Environment variable `GROQ_API_KEY` is not set.")
 
-    # Initialise Groq client
-    groq_client = Groq(api_key=api_key)
+    client = Groq(api_key=api_key)
 
-    # Call the TTS endpoint
     try:
-        tts_response = groq_client.audio.speech.create(
+        response = client.audio.speech.create(
             model="playai-tts",
-            voice=voice,
             input=text,
-            speed=speed,
+            voice=voice,
+            speed=float(speed),
             response_format=output_format,
         )
     except Exception as exc:
-        _logger.error("Groq TTS request failed: %s", exc)
         raise RuntimeError(f"Failed to generate speech via Groq API: {exc}") from exc
 
-    # The response is expected to contain raw bytes in ``content`` attribute
+    unique_name = f"speech_{uuid.uuid4().hex}.{output_format}"
+    audio_file_path = output_dir_path / unique_name
+
     try:
-        audio_bytes = tts_response.content
-        if not isinstance(audio_bytes, (bytes, bytearray)):
-            raise TypeError
+        response.write_to_file(str(audio_file_path))
     except Exception as exc:
-        raise RuntimeError("Unexpected response format from Groq TTS API") from exc
+        raise RuntimeError(f"Unable to write audio file to disk: {exc}") from exc
 
-    return {"audio_bytes": bytes(audio_bytes)}
+    return {
+        "audio_file_path": str(audio_file_path),
+        "format": output_format,
+        "text_length": len(text),
+        "voice_used": voice,
+    }
+
+
+def generate_jarvis_reply(history: List[Dict[str, str]]) -> Dict[str, Any]:
+    """Generate a Jarvis‑style reply based on conversation history."""
+    if not isinstance(history, list):
+        raise ValueError("`history` must be a list of message dictionaries.")
+    if len(history) == 0:
+        raise ValueError("`history` cannot be empty; at least one user message is required.")
+    for idx, msg in enumerate(history):
+        if not isinstance(msg, dict):
+            raise ValueError(f"Message at index {idx} is not a dict.")
+        if "role" not in msg or "content" not in msg:
+            raise ValueError(f"Message at index {idx} must contain 'role' and 'content' keys.")
+        if msg["role"] not in {"user", "assistant"}:
+            raise ValueError(f"Message at index {idx} has invalid role '{msg['role']}'.")
+        if not isinstance(msg["content"], str) or not msg["content"].strip():
+            raise ValueError(f"Message at index {idx} has empty or non‑string content.")
+
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise ValueError("Environment variable `GROQ_API_KEY` is not set.")
+
+    try:
+        groq_client = Groq(api_key=api_key)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to initialise Groq client: {exc}") from exc
+
+    system_message = {
+        "role": "system",
+        "content": (
+            "You are Jarvis, an AI assistant that replies in a helpful, concise, "
+            "and friendly manner. Use the provided conversation history to "
+            "understand context and answer the latest user query."
+        ),
+    }
+
+    messages: List[Dict[str, str]] = [system_message] + history
+
+    try:
+        llm_response = groq_client.chat.completions.create(
+            model="openai/gpt-oss-120b",
+            messages=messages,
+            temperature=0.5,
+            max_tokens=1024,
+            top_p=1.0,
+            stream=False,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Groq API request failed: {exc}") from exc
+
+    try:
+        reply_text: str = llm_response.choices[0].message.content  # type: ignore
+    except (AttributeError, IndexError) as exc:
+        raise RuntimeError("Unexpected response format from Groq API.") from exc
+
+    return {"reply": reply_text}
+
 
 # --------------------------------------------------------------------------- #
-# MAIN
+#                               TEXT‑TO‑SPEECH (BYTES)                       #
 # --------------------------------------------------------------------------- #
+
+SUPPORTED_FORMATS = {"mp3", "opus", "aac", "flac", "wav"}
+
+
+class GroqTTSConfigurationError(RuntimeError):
+    """Raised when the environment or caller configuration is invalid."""
+
+
+def generate_speech_bytes(
+    *,
+    text: str,
+    voice: str = "Aaliyah-PlayAI",
+    speed: float = 1.0,
+    response_format: str = "mp3",
+) -> Dict[str, bytes]:
+    """Convert *text* to spoken audio using Groq’s PlayAI TTS model."""
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("`text` must be a non‑empty string.")
+    if voice not in SUPPORTED_VOICES:
+        raise ValueError(f"`voice` must be one of {SUPPORTED_VOICES!r}. Received: {voice!r}")
+    if not isinstance(speed, (int, float)):
+        raise ValueError("`speed` must be a numeric type.")
+    if not 0.25 <= speed <= 4.0:
+        raise ValueError("`speed` must be between 0.25 and 4.0 (inclusive).")
+    if response_format not in SUPPORTED_FORMATS:
+        raise ValueError(f"`response_format` must be one of {sorted(SUPPORTED_FORMATS)}.")
+
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise GroqTTSConfigurationError("Environment variable `GROQ_API_KEY` is not set.")
+
+    client = Groq(api_key=api_key)
+
+    try:
+        response = client.audio.speech.create(
+            model="playai-tts",
+            input=text,
+            voice=voice,
+            speed=speed,
+            response_format=response_format,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Groq TTS request failed: {exc}")
+
+    try:
+        audio_bytes = response.content  # type: ignore[attr-defined]
+    except Exception as exc:
+        raise RuntimeError(f"Failed to retrieve audio bytes from response: {exc}")
+
+    return {"audio_bytes": audio_bytes}
+
 
 if __name__ == "__main__":
-    _logger.info("🚀 Running my_agent...")
-    # Example usage (can be removed or replaced with real workflow)
-    try:
-        story = generate_children_story("A brave rabbit discovers a hidden garden")
-        _logger.info("Generated story: %s", story["story_text"][:100] + "...")
-
-        speech = generate_speech(
-            text=story["story_text"],
-            voice="Fritz-PlayAI",
-            speed=1.0,
-            output_format="mp3",
-        )
-        # Save the audio to a file for demonstration purposes
-        output_path = "story.mp3"
-        with open(output_path, "wb") as f:
-            f.write(speech["audio_bytes"])
-        _logger.info("Audio saved to %s", output_path)
-    except Exception as e:
-        _logger.exception("An error occurred: %s", e)
+    print("Running my_agent...")
+    # Placeholder for main workflow implementation.
+    # Available functions:
+    # - get_user_text()
+    # - get_user_audio()
+    # - play_audio()
+    # - update_conversation_history()
+    # - generate_speech()
+    # - generate_jarvis_reply()
+    # - generate_speech_bytes()
+    pass
